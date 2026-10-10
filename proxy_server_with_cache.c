@@ -32,8 +32,10 @@ struct cache_element{
 };
 
 cache_element* find(char* url);
+int send_cached_response(int socket, char* url);
 int add_cache_element(char* data,int size,char* url);
 void remove_cache_element();
+static void remove_cache_element_unlocked();
 
 int port_number = 8080;				// Default Port
 int proxy_socketId;					// socket descriptor of proxy server
@@ -139,13 +141,17 @@ int connectRemoteServer(char* host_addr, int port_num)
 int handle_request(int clientSocket, ParsedRequest *request, char *tempReq)
 {
 	char *buf = (char*)malloc(sizeof(char)*MAX_BYTES);
-	strcpy(buf, "GET ");
-	strcat(buf, request->path);
-	strcat(buf, " ");
-	strcat(buf, request->version);
-	strcat(buf, "\r\n");
+	if(buf == NULL)
+		return -1;
 
-	size_t len = strlen(buf);
+	int request_len = snprintf(buf, MAX_BYTES, "GET %s %s\r\n", request->path, request->version);
+	if(request_len < 0 || request_len >= MAX_BYTES)
+	{
+		free(buf);
+		return -1;
+	}
+
+	size_t len = (size_t)request_len;
 
 	if (ParsedHeader_set(request, "Connection", "close") < 0){
 		printf("set header key not work\n");
@@ -180,32 +186,47 @@ int handle_request(int clientSocket, ParsedRequest *request, char *tempReq)
 	char *temp_buffer = (char*)malloc(sizeof(char)*MAX_BYTES); //temp buffer
 	int temp_buffer_size = MAX_BYTES;
 	int temp_buffer_index = 0;
+	if(temp_buffer == NULL)
+	{
+		free(buf);
+		close(remoteSocketID);
+		return -1;
+	}
 
 	while(bytes_send > 0)
 	{
-		bytes_send = send(clientSocket, buf, bytes_send, 0);
+		int bytes_received = bytes_send;
+		bytes_send = send(clientSocket, buf, bytes_received, 0);
 		
-		for(int i=0;i<bytes_send/sizeof(char);i++){
-			temp_buffer[temp_buffer_index] = buf[i];
-			// printf("%c",buf[i]); // Response Printing
-			temp_buffer_index++;
-		}
-		temp_buffer_size += MAX_BYTES;
-		temp_buffer=(char*)realloc(temp_buffer,temp_buffer_size);
-
 		if(bytes_send < 0)
 		{
 			perror("Error in sending data to client socket.\n");
 			break;
 		}
+
+		if(temp_buffer_index + bytes_received > temp_buffer_size)
+		{
+			temp_buffer_size = temp_buffer_index + bytes_received;
+			char *new_temp_buffer = (char*)realloc(temp_buffer, temp_buffer_size);
+			if(new_temp_buffer == NULL)
+			{
+				free(temp_buffer);
+				free(buf);
+				close(remoteSocketID);
+				return -1;
+			}
+			temp_buffer = new_temp_buffer;
+		}
+		memcpy(temp_buffer + temp_buffer_index, buf, bytes_received);
+		temp_buffer_index += bytes_received;
+
 		bzero(buf, MAX_BYTES);
 
 		bytes_send = recv(remoteSocketID, buf, MAX_BYTES-1, 0);
 
 	} 
-	temp_buffer[temp_buffer_index]='\0';
 	free(buf);
-	add_cache_element(temp_buffer, strlen(temp_buffer), tempReq);
+	add_cache_element(temp_buffer, temp_buffer_index, tempReq);
 	printf("Done\n");
 	free(temp_buffer);
 	
@@ -268,30 +289,22 @@ void* thread_fn(void* socketNew)
 	// printf("----------------------%d----------------------\n",strlen(buffer));
 	
 	char *tempReq = (char*)malloc(strlen(buffer)*sizeof(char)+1);
+	if(tempReq == NULL)
+	{
+		close(socket);
+		free(buffer);
+		sem_post(&seamaphore);
+		return NULL;
+	}
     //tempReq, buffer both store the http request sent by client
 	for (int i = 0; i < strlen(buffer); i++)
 	{
 		tempReq[i] = buffer[i];
 	}
+	tempReq[strlen(buffer)] = '\0';
 	
-	//checking for the request in cache 
-	struct cache_element* temp = find(tempReq);
-
-	if( temp != NULL){
-        //request found in cache, so sending the response to client from proxy's cache
-		int size=temp->len/sizeof(char);
-		int pos=0;
-		char response[MAX_BYTES];
-		while(pos<size){
-			bzero(response,MAX_BYTES);
-			for(int i=0;i<MAX_BYTES;i++){
-				response[i]=temp->data[pos];
-				pos++;
-			}
-			send(socket,response,MAX_BYTES,0);
-		}
-		printf("Data retrived from the Cache\n\n");
-		printf("%s\n\n",response);
+	if(send_cached_response(socket, tempReq)){
+		printf("Data retrieved from the Cache\n\n");
 		// close(socketNew);
 		// sem_post(&seamaphore);
 		// return NULL;
@@ -445,8 +458,16 @@ int main(int argc, char * argv[]) {
 		inet_ntop( AF_INET, &ip_addr, str, INET_ADDRSTRLEN );
 		printf("Client is connected with port number: %d and ip address: %s \n",ntohs(client_addr.sin_port), str);
 		//printf("Socket values of index %d in main function is %d\n",i, client_socketId);
-		pthread_create(&tid[i],NULL,thread_fn, (void*)&Connected_socketId[i]); // Creating a thread for each client accepted
-		i++; 
+		if(pthread_create(&tid[i],NULL,thread_fn, (void*)&Connected_socketId[i]) == 0) // Creating a thread for each client accepted
+		{
+			pthread_detach(tid[i]);
+			i = (i + 1) % MAX_CLIENTS;
+		}
+		else
+		{
+			perror("Error while creating thread");
+			close(client_socketId);
+		}
 	}
 	close(proxy_socketId);									// Close socket
  	return 0;
@@ -483,14 +504,59 @@ cache_element* find(char* url){
     return site;
 }
 
+int send_cached_response(int socket, char* url){
+    cache_element* site=NULL;
+    int temp_lock_val = pthread_mutex_lock(&lock);
+	printf("Find Cache Lock Acquired %d\n",temp_lock_val);
+    if(head!=NULL){
+        site = head;
+        while (site!=NULL)
+        {
+            if(!strcmp(site->url,url)){
+				site->lru_time_track = time(NULL);
+				break;
+            }
+            site=site->next;
+        }
+    }
+
+	if(site == NULL)
+	{
+		temp_lock_val = pthread_mutex_unlock(&lock);
+		printf("Find Cache Lock Unlocked %d\n",temp_lock_val);
+		return 0;
+	}
+
+	int size = site->len;
+	int pos = 0;
+	while(pos < size){
+		int chunk_size = MAX_BYTES;
+		if(size - pos < MAX_BYTES)
+			chunk_size = size - pos;
+		if(send(socket, site->data + pos, chunk_size, 0) < 0)
+			break;
+		pos += chunk_size;
+	}
+
+    temp_lock_val = pthread_mutex_unlock(&lock);
+	printf("Find Cache Lock Unlocked %d\n",temp_lock_val);
+    return 1;
+}
+
 void remove_cache_element(){
+    // If cache is not empty searches for the node which has the least lru_time_track and deletes it
+    int temp_lock_val = pthread_mutex_lock(&lock);
+	printf("Remove Cache Lock Acquired %d\n",temp_lock_val);
+	remove_cache_element_unlocked();
+    temp_lock_val = pthread_mutex_unlock(&lock);
+	printf("Remove Cache Lock Unlocked %d\n",temp_lock_val);
+}
+
+static void remove_cache_element_unlocked(){
     // If cache is not empty searches for the node which has the least lru_time_track and deletes it
     cache_element * p ;  	// Cache_element Pointer (Prev. Pointer)
 	cache_element * q ;		// Cache_element Pointer (Next Pointer)
 	cache_element * temp;	// Cache element to remove
-    //sem_wait(&cache_lock);
-    int temp_lock_val = pthread_mutex_lock(&lock);
-	printf("Remove Cache Lock Acquired %d\n",temp_lock_val); 
 	if( head != NULL) { // Cache != empty
 		for (q = head, p = head, temp =head ; q -> next != NULL; 
 			q = q -> next) { // Iterate through entire cache and search for oldest time track
@@ -510,9 +576,6 @@ void remove_cache_element(){
 		free(temp->url); // Free the removed element 
 		free(temp);
 	} 
-	//sem_post(&cache_lock);
-    temp_lock_val = pthread_mutex_unlock(&lock);
-	printf("Remove Cache Lock Unlocked %d\n",temp_lock_val); 
 }
 
 int add_cache_element(char* data,int size,char* url){
@@ -534,12 +597,33 @@ int add_cache_element(char* data,int size,char* url){
     else
     {   while(cache_size+element_size>MAX_SIZE){
             // We keep removing elements from cache until we get enough space to add the element
-            remove_cache_element();
+            remove_cache_element_unlocked();
         }
         cache_element* element = (cache_element*) malloc(sizeof(cache_element)); // Allocating memory for the new cache element
+		if(element == NULL)
+		{
+			temp_lock_val = pthread_mutex_unlock(&lock);
+			printf("Add Cache Lock Unlocked %d\n", temp_lock_val);
+			return 0;
+		}
         element->data= (char*)malloc(size+1); // Allocating memory for the response to be stored in the cache element
-		strcpy(element->data,data); 
+		if(element->data == NULL)
+		{
+			free(element);
+			temp_lock_val = pthread_mutex_unlock(&lock);
+			printf("Add Cache Lock Unlocked %d\n", temp_lock_val);
+			return 0;
+		}
+		memcpy(element->data,data,size);
         element -> url = (char*)malloc(1+( strlen( url )*sizeof(char)  )); // Allocating memory for the request to be stored in the cache element (as a key)
+		if(element->url == NULL)
+		{
+			free(element->data);
+			free(element);
+			temp_lock_val = pthread_mutex_unlock(&lock);
+			printf("Add Cache Lock Unlocked %d\n", temp_lock_val);
+			return 0;
+		}
 		strcpy( element -> url, url );
 		element->lru_time_track=time(NULL);    // Updating the time_track
         element->next=head; 
